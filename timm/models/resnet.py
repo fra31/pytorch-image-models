@@ -392,11 +392,19 @@ class Bottleneck(nn.Module):
             attn_layer=None, aa_layer=None, drop_block=None, drop_path=None):
         super(Bottleneck, self).__init__()
 
-        width = int(math.floor(planes * (base_width / 64)) * cardinality)
+        if isinstance(cardinality, str):
+            assert cardinality == 'dw'
+            cardinality_width = 1
+        else:
+            cardinality_width = cardinality
+        
+        width = int(math.floor(planes * (base_width / 64)) * cardinality_width) #cardinality
         first_planes = width // reduce_first
         outplanes = planes * self.expansion
         first_dilation = first_dilation or dilation
         use_aa = aa_layer is not None and (stride == 2 or first_dilation != dilation)
+        
+        groups = cardinality if not isinstance(cardinality, str) else width # to get dw convolutions
 
         self.conv1 = nn.Conv2d(inplanes, first_planes, kernel_size=1, bias=False)
         self.bn1 = norm_layer(first_planes)
@@ -404,7 +412,7 @@ class Bottleneck(nn.Module):
 
         self.conv2 = nn.Conv2d(
             first_planes, width, kernel_size=3, stride=1 if use_aa else stride,
-            padding=first_dilation, dilation=first_dilation, groups=cardinality, bias=False)
+            padding=first_dilation, dilation=first_dilation, groups=groups, bias=False)
         self.bn2 = norm_layer(width)
         self.drop_block = drop_block() if drop_block is not None else nn.Identity()
         self.act2 = act_layer(inplace=True)
@@ -591,62 +599,77 @@ class ResNet(nn.Module):
     norm_layer : nn.Module, normalization layer
     aa_layer : nn.Module, anti-aliasing layer
     drop_rate : float, default 0. Dropout probability before classifier, for training
+    channel_expansion : int, default 1, multiplier for number of channels
     """
 
     def __init__(
             self, block, layers, num_classes=1000, in_chans=3, output_stride=32, global_pool='avg',
             cardinality=1, base_width=64, stem_width=64, stem_type='', replace_stem_pool=False, block_reduce_first=1,
             down_kernel_size=1, avg_down=False, act_layer=nn.ReLU, norm_layer=nn.BatchNorm2d, aa_layer=None,
-            drop_rate=0.0, drop_path_rate=0., drop_block_rate=0., zero_init_last=True, block_args=None):
+            drop_rate=0.0, drop_path_rate=0., drop_block_rate=0., zero_init_last=True, block_args=None,
+            channel_expansion=1):
         super(ResNet, self).__init__()
         block_args = block_args or dict()
         assert output_stride in (8, 16, 32)
         self.num_classes = num_classes
         self.drop_rate = drop_rate
         self.grad_checkpointing = False
+        self.stem_type = stem_type
 
-        # Stem
-        deep_stem = 'deep' in stem_type
-        inplanes = stem_width * 2 if deep_stem else 64
-        if deep_stem:
-            stem_chs = (stem_width, stem_width)
-            if 'tiered' in stem_type:
-                stem_chs = (3 * (stem_width // 4), stem_width)
-            self.conv1 = nn.Sequential(*[
-                nn.Conv2d(in_chans, stem_chs[0], 3, stride=2, padding=1, bias=False),
-                norm_layer(stem_chs[0]),
-                act_layer(inplace=True),
-                nn.Conv2d(stem_chs[0], stem_chs[1], 3, stride=1, padding=1, bias=False),
-                norm_layer(stem_chs[1]),
-                act_layer(inplace=True),
-                nn.Conv2d(stem_chs[1], inplanes, 3, stride=1, padding=1, bias=False)])
-        else:
-            self.conv1 = nn.Conv2d(in_chans, inplanes, kernel_size=7, stride=2, padding=3, bias=False)
-        self.bn1 = norm_layer(inplanes)
-        self.act1 = act_layer(inplace=True)
-        self.feature_info = [dict(num_chs=inplanes, reduction=2, module='act1')]
-
-        # Stem pooling. The name 'maxpool' remains for weight compatibility.
-        if replace_stem_pool:
-            self.maxpool = nn.Sequential(*filter(None, [
-                nn.Conv2d(inplanes, inplanes, 3, stride=1 if aa_layer else 2, padding=1, bias=False),
-                create_aa(aa_layer, channels=inplanes, stride=2) if aa_layer is not None else None,
-                norm_layer(inplanes),
-                act_layer(inplace=True)
-            ]))
-        else:
-            if aa_layer is not None:
-                if issubclass(aa_layer, nn.AvgPool2d):
-                    self.maxpool = aa_layer(2)
-                else:
-                    self.maxpool = nn.Sequential(*[
-                        nn.MaxPool2d(kernel_size=3, stride=1, padding=1),
-                        aa_layer(channels=inplanes, stride=2)])
+        if not stem_type in ['patch']:
+            # Stem
+            deep_stem = 'deep' in stem_type
+            inplanes = stem_width * 2 if deep_stem else 64
+            if deep_stem:
+                stem_chs = (stem_width, stem_width)
+                if 'tiered' in stem_type:
+                    stem_chs = (3 * (stem_width // 4), stem_width)
+                self.conv1 = nn.Sequential(*[
+                    nn.Conv2d(in_chans, stem_chs[0], 3, stride=2, padding=1, bias=False),
+                    norm_layer(stem_chs[0]),
+                    act_layer(inplace=True),
+                    nn.Conv2d(stem_chs[0], stem_chs[1], 3, stride=1, padding=1, bias=False),
+                    norm_layer(stem_chs[1]),
+                    act_layer(inplace=True),
+                    nn.Conv2d(stem_chs[1], inplanes, 3, stride=1, padding=1, bias=False)])
             else:
-                self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+                self.conv1 = nn.Conv2d(in_chans, inplanes, kernel_size=7, stride=2, padding=3, bias=False)
+            self.bn1 = norm_layer(inplanes)
+            self.act1 = act_layer(inplace=True)
+            self.feature_info = [dict(num_chs=inplanes, reduction=2, module='act1')]
+    
+            # Stem pooling. The name 'maxpool' remains for weight compatibility.
+            if replace_stem_pool:
+                self.maxpool = nn.Sequential(*filter(None, [
+                    nn.Conv2d(inplanes, inplanes, 3, stride=1 if aa_layer else 2, padding=1, bias=False),
+                    create_aa(aa_layer, channels=inplanes, stride=2) if aa_layer is not None else None,
+                    norm_layer(inplanes),
+                    act_layer(inplace=True)
+                ]))
+            else:
+                if aa_layer is not None:
+                    if issubclass(aa_layer, nn.AvgPool2d):
+                        self.maxpool = aa_layer(2)
+                    else:
+                        self.maxpool = nn.Sequential(*[
+                            nn.MaxPool2d(kernel_size=3, stride=1, padding=1),
+                            aa_layer(channels=inplanes, stride=2)])
+                else:
+                    self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        
+        elif stem_type == 'patch':
+            ### TODO: currently this doesn't change with channel_expansion, it might improve accuracy
+            inplanes = 64
+            patch_size = 4
+            self.stem = nn.Sequential(
+                nn.Conv2d(in_chans, inplanes, kernel_size=patch_size, stride=patch_size),
+                norm_layer(inplanes)
+            )
+            self.feature_info = [] # check if something else is needed
 
         # Feature Blocks
         channels = [64, 128, 256, 512]
+        channels = [int(c * channel_expansion) for c in channels]
         stage_modules, stage_feature_info = make_blocks(
             block, channels, layers, inplanes, cardinality=cardinality, base_width=base_width,
             output_stride=output_stride, reduce_first=block_reduce_first, avg_down=avg_down,
@@ -657,7 +680,7 @@ class ResNet(nn.Module):
         self.feature_info.extend(stage_feature_info)
 
         # Head (Pooling and Classifier)
-        self.num_features = 512 * block.expansion
+        self.num_features = int(512 * block.expansion * channel_expansion)
         self.global_pool, self.fc = create_classifier(self.num_features, self.num_classes, pool_type=global_pool)
 
         self.init_weights(zero_init_last=zero_init_last)
@@ -693,10 +716,13 @@ class ResNet(nn.Module):
         self.global_pool, self.fc = create_classifier(self.num_features, self.num_classes, pool_type=global_pool)
 
     def forward_features(self, x):
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.act1(x)
-        x = self.maxpool(x)
+        if not self.stem_type in ['patch']:
+            x = self.conv1(x)
+            x = self.bn1(x)
+            x = self.act1(x)
+            x = self.maxpool(x)
+        else:
+            x = self.stem(x)
 
         if self.grad_checkpointing and not torch.jit.is_scripting():
             x = checkpoint_seq([self.layer1, self.layer2, self.layer3, self.layer4], x, flatten=True)

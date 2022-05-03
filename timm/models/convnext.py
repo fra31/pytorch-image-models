@@ -236,6 +236,16 @@ class ConvNeXt(nn.Module):
             )
             curr_stride = patch_size
             prev_chs = dims[0]
+        elif stem_type == 'rn-like':
+            inplanes = 64
+            self.stem = nn.Sequential(
+                nn.Conv2d(in_chans, inplanes, kernel_size=7, stride=2, padding=3, bias=False),
+                norm_layer(inplanes),
+                nn.GELU(), #nn.ReLU(inplace=True)
+                nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+            )
+            curr_stride = 2
+            prev_chs = inplanes
         else:
             self.stem = nn.Sequential(
                 nn.Conv2d(in_chans, 32, kernel_size=3, stride=2, padding=1),
@@ -327,7 +337,8 @@ class ConvNeXt(nn.Module):
 def _init_weights(module, name=None, head_init_scale=1.0):
     if isinstance(module, nn.Conv2d):
         trunc_normal_(module.weight, std=.02)
-        nn.init.constant_(module.bias, 0)
+        if not module.bias is None:
+            nn.init.constant_(module.bias, 0)
     elif isinstance(module, nn.Linear):
         trunc_normal_(module.weight, std=.02)
         nn.init.constant_(module.bias, 0)
