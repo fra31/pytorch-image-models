@@ -26,6 +26,9 @@ from .registry import register_model
 __all__ = ['ConvNeXt']  # model_registry will add each entrypoint fn to this
 
 
+ACT_DICT = {'gelu': nn.GELU, 'relu': nn.ReLU}
+
+
 def _cfg(url='', **kwargs):
     return {
         'url': url,
@@ -133,15 +136,17 @@ class ConvNeXtBlock(nn.Module):
         ls_init_value (float): Init value for Layer Scale. Default: 1e-6.
     """
 
-    def __init__(self, dim, drop_path=0., ls_init_value=1e-6, conv_mlp=False, mlp_ratio=4, norm_layer=None):
+    def __init__(self, dim, drop_path=0., ls_init_value=1e-6, conv_mlp=False, mlp_ratio=4, norm_layer=None,
+        act_fn='gelu'):
         super().__init__()
         if not norm_layer:
             norm_layer = partial(LayerNorm2d, eps=1e-6) if conv_mlp else partial(nn.LayerNorm, eps=1e-6)
         mlp_layer = ConvMlp if conv_mlp else Mlp
+        act_layer = ACT_DICT[act_fn]
         self.use_conv_mlp = conv_mlp
         self.conv_dw = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)  # depthwise conv
         self.norm = norm_layer(dim)
-        self.mlp = mlp_layer(dim, int(mlp_ratio * dim), act_layer=nn.GELU)
+        self.mlp = mlp_layer(dim, int(mlp_ratio * dim), act_layer=act_layer) #nn.GELU
         self.gamma = nn.Parameter(ls_init_value * torch.ones(dim)) if ls_init_value > 0 else None
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
@@ -166,7 +171,7 @@ class ConvNeXtStage(nn.Module):
 
     def __init__(
             self, in_chs, out_chs, stride=2, depth=2, dp_rates=None, ls_init_value=1.0, conv_mlp=False,
-            norm_layer=None, cl_norm_layer=None, cross_stage=False):
+            norm_layer=None, cl_norm_layer=None, cross_stage=False, act_fn='gelu'):
         super().__init__()
         self.grad_checkpointing = False
 
@@ -181,7 +186,7 @@ class ConvNeXtStage(nn.Module):
         dp_rates = dp_rates or [0.] * depth
         self.blocks = nn.Sequential(*[ConvNeXtBlock(
             dim=out_chs, drop_path=dp_rates[j], ls_init_value=ls_init_value, conv_mlp=conv_mlp,
-            norm_layer=norm_layer if conv_mlp else cl_norm_layer)
+            norm_layer=norm_layer if conv_mlp else cl_norm_layer, act_fn=act_fn)
             for j in range(depth)]
         )
 
@@ -213,6 +218,7 @@ class ConvNeXt(nn.Module):
             self, in_chans=3, num_classes=1000, global_pool='avg', output_stride=32, patch_size=4,
             depths=(3, 3, 9, 3), dims=(96, 192, 384, 768),  ls_init_value=1e-6, conv_mlp=False, stem_type='patch',
             head_init_scale=1., head_norm_first=False, norm_layer=None, drop_rate=0., drop_path_rate=0.,
+            act_fn='gelu',
     ):
         super().__init__()
         assert output_stride == 32
@@ -268,7 +274,7 @@ class ConvNeXt(nn.Module):
             stages.append(ConvNeXtStage(
                 prev_chs, out_chs, stride=stride,
                 depth=depths[i], dp_rates=dp_rates[i], ls_init_value=ls_init_value, conv_mlp=conv_mlp,
-                norm_layer=norm_layer, cl_norm_layer=cl_norm_layer)
+                norm_layer=norm_layer, cl_norm_layer=cl_norm_layer, act_fn=act_fn)
             )
             prev_chs = out_chs
             # NOTE feature_info use currently assumes stage 0 == stride 1, rest are stride 2

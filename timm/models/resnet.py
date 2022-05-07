@@ -19,7 +19,7 @@ from .helpers import build_model_with_cfg, checkpoint_seq
 from .layers import DropBlock2d, DropPath, AvgPool2dSame, BlurPool2d, GroupNorm, create_attn, get_attn, create_classifier
 from .registry import register_model
 
-__all__ = ['ResNet', 'BasicBlock', 'Bottleneck']  # model_registry will add each entrypoint fn to this
+__all__ = ['ResNet', 'BasicBlock', 'Bottleneck', 'ConvNeXtBottleneck']  # model_registry will add each entrypoint fn to this
 
 
 def _cfg(url='', **kwargs):
@@ -385,11 +385,13 @@ class BasicBlock(nn.Module):
 
 class Bottleneck(nn.Module):
     expansion = 4
+    name = 'Bottleneck'
 
     def __init__(
             self, inplanes, planes, stride=1, downsample=None, cardinality=1, base_width=64,
             reduce_first=1, dilation=1, first_dilation=None, act_layer=nn.ReLU, norm_layer=nn.BatchNorm2d,
-            attn_layer=None, aa_layer=None, drop_block=None, drop_path=None):
+            attn_layer=None, aa_layer=None, drop_block=None, drop_path=None, is_last=False,
+            is_first=False, is_first_layer=False):
         super(Bottleneck, self).__init__()
 
         if isinstance(cardinality, str):
@@ -460,6 +462,97 @@ class Bottleneck(nn.Module):
         x = self.act3(x)
 
         return x
+        
+
+class ConvNeXtBottleneck(nn.Module):
+    expansion = 4
+    name = 'ConvNeXtBottleneck'
+
+    def __init__(
+            self, inplanes, planes, stride=1, downsample=None, cardinality=1, base_width=64,
+            reduce_first=1, dilation=1, first_dilation=None, act_layer=nn.ReLU, norm_layer=nn.BatchNorm2d,
+            attn_layer=None, aa_layer=None, drop_block=None, drop_path=None, type_bottleneck='inverted',
+            is_last=False, is_first=False, is_first_layer=False):
+        super(ConvNeXtBottleneck, self).__init__()
+
+        if isinstance(cardinality, str):
+            assert cardinality == 'dw'
+            cardinality_width = 1
+        else:
+            cardinality_width = cardinality
+            
+        if type_bottleneck == 'inverted':
+            temp = inplanes + 0
+            inplanes = planes if not is_first or is_first_layer else planes // 2
+            planes = temp if not is_first or is_first_layer else temp * 2
+            #print(f'using inverted bottleneck with dims ({inplanes}, {planes})')
+        
+        width = int(math.floor(planes * (base_width / 64)) * cardinality_width) #cardinality
+        first_planes = width // reduce_first
+        #outplanes = planes // self.expansion if downsample is None else planes #planes * self.expansion
+        outplanes = planes // self.expansion if not (is_first and is_first_layer) else planes
+        #outplanes = planes
+        #print(outplanes)
+        first_dilation = first_dilation or dilation
+        use_aa = aa_layer is not None and (stride == 2 or first_dilation != dilation)
+        
+        groups = cardinality if not isinstance(cardinality, str) else width # to get dw convolutions
+
+        self.conv1 = nn.Conv2d(inplanes, first_planes, kernel_size=1, bias=False)
+        self.bn1 = norm_layer(first_planes)
+        self.act1 = act_layer(inplace=True)
+
+        self.conv2 = nn.Conv2d(
+            first_planes, width, kernel_size=3, stride=1 if use_aa else stride,
+            padding=first_dilation, dilation=first_dilation, groups=groups, bias=False)
+        self.bn2 = norm_layer(width)
+        self.drop_block = drop_block() if drop_block is not None else nn.Identity()
+        self.act2 = act_layer(inplace=True)
+        self.aa = create_aa(aa_layer, channels=width, stride=stride, enable=use_aa)
+
+        self.conv3 = nn.Conv2d(width, outplanes, kernel_size=1, bias=False)
+        self.bn3 = norm_layer(outplanes)
+
+        self.se = create_attn(attn_layer, outplanes)
+
+        self.act3 = act_layer(inplace=True)
+        self.downsample = downsample
+        self.stride = stride
+        self.dilation = dilation
+        self.drop_path = drop_path
+
+    def zero_init_last(self):
+        nn.init.zeros_(self.bn3.weight)
+
+    def forward(self, x):
+        shortcut = x
+
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.act1(x)
+
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = self.drop_block(x)
+        x = self.act2(x)
+        x = self.aa(x)
+
+        x = self.conv3(x)
+        x = self.bn3(x)
+
+        if self.se is not None:
+            x = self.se(x)
+
+        if self.drop_path is not None:
+            x = self.drop_path(x)
+
+        if self.downsample is not None:
+            shortcut = self.downsample(shortcut)
+        #print(shortcut.shape, x.shape)
+        x += shortcut
+        x = self.act3(x)
+
+        return x
 
 
 def downsample_conv(
@@ -509,6 +602,10 @@ def make_blocks(
     net_block_idx = 0
     net_stride = 4
     dilation = prev_dilation = 1
+    '''print(block_fn)
+    print(type(block_fn))
+    print(isinstance(block_fn, ConvNeXtBottleneck))
+    print(block_fn.name)'''
     for stage_idx, (planes, num_blocks, db) in enumerate(zip(channels, block_repeats, drop_blocks(drop_block_rate))):
         stage_name = f'layer{stage_idx + 1}'  # never liked this name, but weight compat requires it
         stride = 1 if stage_idx == 0 else 2
@@ -520,8 +617,15 @@ def make_blocks(
 
         downsample = None
         if stride != 1 or inplanes != planes * block_fn.expansion:
+            if block_fn.name == 'ConvNeXtBottleneck':
+                in_channels = planes // 2 if stage_idx != 0 else planes
+                out_channels = planes
+                #print(out_channels)
+            else:
+                in_channels = inplanes
+                out_channels = planes * block_fn.expansion
             down_kwargs = dict(
-                in_channels=inplanes, out_channels=planes * block_fn.expansion, kernel_size=down_kernel_size,
+                in_channels=in_channels, out_channels=out_channels, kernel_size=down_kernel_size,
                 stride=stride, dilation=dilation, first_dilation=prev_dilation, norm_layer=kwargs.get('norm_layer'))
             downsample = downsample_avg(**down_kwargs) if avg_down else downsample_conv(**down_kwargs)
 
@@ -531,9 +635,13 @@ def make_blocks(
             downsample = downsample if block_idx == 0 else None
             stride = stride if block_idx == 0 else 1
             block_dpr = drop_path_rate * net_block_idx / (net_num_blocks - 1)  # stochastic depth linear decay rule
+            is_last = block_idx == num_blocks - 1
+            is_first = block_idx == 0
             blocks.append(block_fn(
                 inplanes, planes, stride, downsample, first_dilation=prev_dilation,
-                drop_path=DropPath(block_dpr) if block_dpr > 0. else None, **block_kwargs))
+                drop_path=DropPath(block_dpr) if block_dpr > 0. else None,
+                is_last=is_last, is_first=is_first, is_first_layer=stage_idx == 0,
+                **block_kwargs))
             prev_dilation = dilation
             inplanes = planes * block_fn.expansion
             net_block_idx += 1
@@ -619,7 +727,7 @@ class ResNet(nn.Module):
         if not stem_type in ['patch']:
             # Stem
             deep_stem = 'deep' in stem_type
-            inplanes = stem_width * 2 if deep_stem else 64
+            inplanes = stem_width * 2 if deep_stem else int(64 * channel_expansion)
             if deep_stem:
                 stem_chs = (stem_width, stem_width)
                 if 'tiered' in stem_type:
@@ -659,7 +767,8 @@ class ResNet(nn.Module):
         
         elif stem_type == 'patch':
             ### TODO: currently this doesn't change with channel_expansion, it might improve accuracy
-            inplanes = 64
+            # edit: added channel_expansion for compatibility with inverted bottleneck
+            inplanes = int(64 * channel_expansion)
             patch_size = 4
             self.stem = nn.Sequential(
                 nn.Conv2d(in_chans, inplanes, kernel_size=patch_size, stride=patch_size),
@@ -680,7 +789,10 @@ class ResNet(nn.Module):
         self.feature_info.extend(stage_feature_info)
 
         # Head (Pooling and Classifier)
-        self.num_features = int(512 * block.expansion * channel_expansion)
+        if block.name in ['Bottleneck']:
+            self.num_features = int(512 * block.expansion * channel_expansion)
+        elif block.name == 'ConvNeXtBottleneck':
+            self.num_features = int(512 * channel_expansion) # TODO: less features with inverted bottleneck?
         self.global_pool, self.fc = create_classifier(self.num_features, self.num_classes, pool_type=global_pool)
 
         self.init_weights(zero_init_last=zero_init_last)
