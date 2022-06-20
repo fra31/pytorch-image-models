@@ -45,6 +45,7 @@ class ConvMixer(nn.Module):
         self.num_classes = num_classes
         self.num_features = dim
         self.grad_checkpointing = False
+        padding = (kernel_size - 1) // 2
 
         self.stem = nn.Sequential(
             nn.Conv2d(in_chans, dim, kernel_size=patch_size, stride=patch_size),
@@ -54,7 +55,7 @@ class ConvMixer(nn.Module):
         self.blocks = nn.Sequential(
             *[nn.Sequential(
                     Residual(nn.Sequential(
-                        nn.Conv2d(dim, dim, kernel_size, groups=dim, padding="same"),
+                        nn.Conv2d(dim, dim, kernel_size, groups=dim, padding=padding),
                         act_layer(),
                         nn.BatchNorm2d(dim)
                     )),
